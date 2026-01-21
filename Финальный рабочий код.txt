@@ -1,0 +1,606 @@
+/*******************************************************
+ * GS Sync PRODUCTION: Bitrix24 Smart Process + Google Sheets + Drive Photos
+ * Авторизация: OAuth (локальное приложение Bitrix24) + refresh token
+ *
+ * Логика:
+ * - 1-я строка: заголовки
+ * - 2-я строка: UF-токены вида {UfCrm1017684...}
+ * - 3+ строки: данные
+ *
+ * Upsert без дублей: ключ = parentId2 (ID сделки) + UF "Номер удостоверения"
+ * Фото: ищем в папке Drive по ФИО (имя файла = "ФИО.jpg/png"), грузим в UF_PHOTO
+ *******************************************************/
+
+const PROP = PropertiesService.getScriptProperties();
+
+/** ====== НАСТРОЙКИ ====== */
+const CFG = {
+  PORTAL: "aserqazin.bitrix24.kz",        // без https://
+  ENTITY_TYPE_ID: 1042,                  // entityTypeId смарт-процесса
+  CATEGORY_ID: 16,                       // если не нужно — поставьте "" (пусто)
+
+  // Ключевые колонки в 1-й строке (заголовки)
+  DEAL_HEADER: "ID Сделки",
+  CERT_HEADER: "Номер удостоверения",
+
+  // Какой UF в Битрикс хранит номер удостоверения (для ключа и фильтра)
+  // (в вашем clean-скрипте это ufCrm10_1768477904) :contentReference[oaicite:3]{index=3}
+  UF_CERT_NO: "ufCrm10_1768477904",
+
+  // Фото
+  UF_PHOTO: "ufCrm10_1768478150",        // одиночное файл-поле фото
+  PHOTO_FOLDER_ID: "1pNnClBz39AqIHAvAcoKJTN3LiOvC-v3q", // Drive folder id, "" если фото не нужно
+  ALWAYS_UPDATE_PHOTO: true,             // true — всегда пытаться обновлять фото
+
+  // Лог-колонки (будут созданы автоматически, если нет)
+  COL_ITEM_ID: "BITRIX_ITEM_ID",
+  COL_STATUS: "SYNC_STATUS",
+  COL_SYNC_AT: "SYNC_AT",
+  COL_RESP: "BITRIX_RESP",
+  COL_DEBUG: "DEBUG",
+
+  SHEET_NAME: "Лист1",
+
+  // throttling
+  SLEEP_MS: 150,
+
+  // (опционально) если ScriptApp.getService().getUrl() пустой — вставьте /exec
+  WEBAPP_URL: ""
+};
+
+/** Script Properties keys */
+const KEYS = {
+  CLIENT_ID: "B24_CLIENT_ID",
+  CLIENT_SECRET: "B24_CLIENT_SECRET",
+  ACCESS_TOKEN: "B24_ACCESS_TOKEN",
+  REFRESH_TOKEN: "B24_REFRESH_TOKEN",
+  EXPIRES_AT: "B24_TOKEN_EXPIRES_AT",
+  REST_ENDPOINT: "B24_REST_ENDPOINT",
+  OAUTH_STATE: "B24_OAUTH_STATE",
+  WEBAPP_URL: "WEBAPP_URL"
+};
+
+/** ====== WEBAPP ENTRY (для OAuth callback) ====== */
+function doGet(e) { return handle_(e, "GET"); }
+function doPost(e) { return handle_(e, "POST"); }
+
+function handle_(e, verb) {
+  const params = (e && e.parameter) ? e.parameter : {};
+  const code = params.code || "";
+  const state = params.state || "";
+
+  // OAuth callback
+  if (code) {
+    const savedState = PROP.getProperty(KEYS.OAUTH_STATE) || "";
+    if (!savedState || !state || state !== savedState) {
+      return HtmlService.createHtmlOutput(
+        "<h3>STATE не совпал</h3><p>Запустите <b>startOAuth()</b> и пройдите авторизацию заново.</p>"
+      );
+    }
+
+    const token = exchangeCodeForToken_(code);
+
+    if (token.refresh_token) PROP.setProperty(KEYS.REFRESH_TOKEN, token.refresh_token);
+    if (token.access_token) PROP.setProperty(KEYS.ACCESS_TOKEN, token.access_token);
+
+    const expiresIn = Number(token.expires_in || 3600);
+    const expiresAt = Date.now() + expiresIn * 1000 - 60000;
+    PROP.setProperty(KEYS.EXPIRES_AT, String(expiresAt));
+
+    if (token.client_endpoint) {
+      PROP.setProperty(KEYS.REST_ENDPOINT, token.client_endpoint);
+    } else {
+      PROP.setProperty(KEYS.REST_ENDPOINT, "https://" + CFG.PORTAL + "/rest/");
+    }
+
+    return HtmlService.createHtmlOutput(
+      "<h2>OK</h2><p>Токены сохранены. Теперь запустите <b>testB24Ping()</b> и затем <b>upsertFromSheet_PROD()</b>.</p>"
+    );
+  }
+
+  // обычная страница статуса
+  const hasRefresh = !!(PROP.getProperty(KEYS.REFRESH_TOKEN) || "");
+  const hasAccess = !!(PROP.getProperty(KEYS.ACCESS_TOKEN) || "");
+  const html =
+    "<h2>GS Sync</h2>" +
+    "<p>Метод: <b>" + verb + "</b></p>" +
+    "<p>Bitrix tokens: " + (hasRefresh ? "refresh ✅" : "refresh ❌") + " / " + (hasAccess ? "access ✅" : "access ❌") + "</p>" +
+    "<p>Запуск OAuth: выполните <b>startOAuth()</b> (смотрите ссылку в логах).</p>";
+  return HtmlService.createHtmlOutput(html);
+}
+
+/** ====== 1) Сохранить client_id / client_secret один раз ====== */
+function setupCredentialsOnce() {
+  // ВСТАВЬТЕ сюда данные локального приложения Bitrix24
+  const clientId = "local.696986fdebaa25.59124262";
+  const clientSecret = "S9tyRWK8GF4xBNOc6PV7rpOwZ8SLHesIjJJESjyEy6pIGnZYVd";
+
+  if (!clientId || clientId.indexOf("PASTE_") === 0) throw new Error("Вставьте clientId в setupCredentialsOnce()");
+  if (!clientSecret || clientSecret.indexOf("PASTE_") === 0) throw new Error("Вставьте clientSecret в setupCredentialsOnce()");
+
+  PROP.setProperty(KEYS.CLIENT_ID, String(clientId).trim());
+  PROP.setProperty(KEYS.CLIENT_SECRET, String(clientSecret).trim());
+  Logger.log("OK: client_id/client_secret сохранены в Script Properties.");
+}
+
+function saveWebAppUrlOnce() {
+  const url = ScriptApp.getService().getUrl() || "";
+  if (!url) throw new Error("ScriptApp.getService().getUrl() пустой. Сначала Deploy WebApp.");
+  PROP.setProperty(KEYS.WEBAPP_URL, url);
+  Logger.log("OK: WEBAPP_URL сохранён: " + url);
+}
+
+function clearAuth() {
+  PROP.deleteProperty(KEYS.ACCESS_TOKEN);
+  PROP.deleteProperty(KEYS.REFRESH_TOKEN);
+  PROP.deleteProperty(KEYS.EXPIRES_AT);
+  PROP.deleteProperty(KEYS.REST_ENDPOINT);
+  PROP.deleteProperty(KEYS.OAUTH_STATE);
+  Logger.log("OK: токены удалены");
+}
+
+/** ====== 2) OAuth start ====== */
+function startOAuth() {
+  const clientId = getClientId_();
+  const redirectUri = getWebAppUrl_(); // строго /exec
+  const state = Utilities.getUuid();
+  PROP.setProperty(KEYS.OAUTH_STATE, state);
+
+  const url =
+    "https://oauth.bitrix.info/oauth/authorize/?" +
+    "client_id=" + encodeURIComponent(clientId) +
+    "&response_type=code" +
+    "&redirect_uri=" + encodeURIComponent(redirectUri) +
+    "&state=" + encodeURIComponent(state);
+
+  Logger.log("Откройте ссылку и разрешите доступ:\n" + url);
+  return HtmlService.createHtmlOutput(
+    "<h3>Откройте ссылку</h3>" +
+    "<p><a target='_blank' href='" + url + "'>Авторизация Bitrix</a></p>" +
+    "<p>redirect_uri: <code>" + redirectUri + "</code></p>"
+  );
+}
+
+function exchangeCodeForToken_(code) {
+  const url = "https://oauth.bitrix.info/oauth/token/";
+  const payload = {
+    grant_type: "authorization_code",
+    client_id: getClientId_(),
+    client_secret: getClientSecret_(),
+    code: code,
+    redirect_uri: getWebAppUrl_()
+  };
+
+  const resp = UrlFetchApp.fetch(url, { method: "post", payload, muteHttpExceptions: true });
+  const txt = resp.getContentText();
+  if (resp.getResponseCode() !== 200) throw new Error("Token exchange HTTP=" + resp.getResponseCode() + "\n" + txt);
+
+  const j = safeJson_(txt);
+  if (!j || !j.access_token) throw new Error("Нет access_token в ответе:\n" + txt);
+  return j;
+}
+
+function refreshToken_() {
+  const refresh = PROP.getProperty(KEYS.REFRESH_TOKEN) || "";
+  if (!refresh) throw new Error("Нет refresh_token. Сначала startOAuth() и авторизация.");
+
+  const url = "https://oauth.bitrix.info/oauth/token/";
+  const payload = {
+    grant_type: "refresh_token",
+    client_id: getClientId_(),
+    client_secret: getClientSecret_(),
+    refresh_token: refresh
+  };
+
+  const resp = UrlFetchApp.fetch(url, { method: "post", payload, muteHttpExceptions: true });
+  const txt = resp.getContentText();
+  if (resp.getResponseCode() !== 200) throw new Error("Refresh HTTP=" + resp.getResponseCode() + "\n" + txt);
+
+  const j = safeJson_(txt);
+  if (!j || !j.access_token) throw new Error("Нет access_token после refresh:\n" + txt);
+
+  PROP.setProperty(KEYS.ACCESS_TOKEN, j.access_token);
+  if (j.refresh_token) PROP.setProperty(KEYS.REFRESH_TOKEN, j.refresh_token);
+
+  const expiresIn = Number(j.expires_in || 3600);
+  const expiresAt = Date.now() + expiresIn * 1000 - 60000;
+  PROP.setProperty(KEYS.EXPIRES_AT, String(expiresAt));
+
+  if (j.client_endpoint) PROP.setProperty(KEYS.REST_ENDPOINT, j.client_endpoint);
+  return j.access_token;
+}
+
+function getAccessToken_() {
+  const expiresAt = Number(PROP.getProperty(KEYS.EXPIRES_AT) || "0");
+  const token = PROP.getProperty(KEYS.ACCESS_TOKEN) || "";
+  if (token && Date.now() < expiresAt) return token;
+  return refreshToken_();
+}
+
+/** ====== Bitrix REST ====== */
+function callB24_(method, params) {
+  const token = getAccessToken_();
+  const base = PROP.getProperty(KEYS.REST_ENDPOINT) || ("https://" + CFG.PORTAL + "/rest/");
+  const url = base + method.replace(/\.json$/i, "") + ".json";
+
+  const body = Object.assign({}, params || {}, { auth: token });
+
+  const resp = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json; charset=utf-8",
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true
+  });
+
+  const txt = resp.getContentText();
+  const code = resp.getResponseCode();
+  const j = safeJson_(txt) || {};
+
+  if (code !== 200) throw new Error("REST HTTP=" + code + "\n" + txt);
+  if (j.error) throw new Error("REST error: " + j.error + " / " + (j.error_description || "") + "\n" + txt);
+
+  return { code, txt, json: j };
+}
+
+function testB24Ping() {
+  const r = callB24_("user.current", {});
+  Logger.log(r.txt);
+}
+
+/** ====== MAIN: UPSERT PROD ====== */
+function upsertFromSheet_PROD() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SHEET_NAME);
+  if (!sh) throw new Error("Не найден лист: " + CFG.SHEET_NAME);
+
+  const values = sh.getDataRange().getValues();
+  if (values.length < 3) throw new Error("Нужно минимум 3 строки: заголовки, UF-коды, данные");
+
+  // 1 строка заголовки, 2 строка UF токены
+  const header = values[0].map(v => String(v || "").trim());
+  const codesRow = values[1];
+
+  const dealCol = findCol_(header, CFG.DEAL_HEADER);
+  const certCol = findCol_(header, CFG.CERT_HEADER);
+  if (dealCol < 0) throw new Error("Не найдена колонка: " + CFG.DEAL_HEADER);
+  if (certCol < 0) throw new Error("Не найдена колонка: " + CFG.CERT_HEADER);
+
+  const colItemId = ensureCol_(sh, header, CFG.COL_ITEM_ID);
+  const colStatus = ensureCol_(sh, header, CFG.COL_STATUS);
+  const colSyncAt = ensureCol_(sh, header, CFG.COL_SYNC_AT);
+  const colResp   = ensureCol_(sh, header, CFG.COL_RESP);
+  const colDebug  = ensureCol_(sh, header, CFG.COL_DEBUG);
+
+  // map: columnIndex -> ufCode (из 2-й строки)
+  const ufByCol = buildUfMapFromSecondRow_(codesRow);
+
+  // Фото индексируем 1 раз
+  let photoIndex = null;
+  if (String(CFG.PHOTO_FOLDER_ID || "").trim()) {
+    photoIndex = buildPhotoIndex_(CFG.PHOTO_FOLDER_ID);
+  }
+
+  for (let r = 2; r < values.length; r++) {
+    const row = values[r];
+    try {
+      const dealId = Number(row[dealCol]);
+      const certNo = String(row[certCol] ?? "").trim();
+
+      if (!dealId) {
+        writeCell_(sh, r, colStatus, "❌ Нет ID сделки");
+        continue;
+      }
+      if (!certNo) {
+        writeCell_(sh, r, colStatus, "❌ Нет номера удостоверения");
+        continue;
+      }
+
+      // Собираем fields
+      const fields = {
+        TITLE: String(row[0] || "").trim() || "Удостоверение",
+        OPENED: "Y"
+      };
+
+      // categoryId только если задан
+      if (CFG.CATEGORY_ID !== "" && CFG.CATEGORY_ID !== null && typeof CFG.CATEGORY_ID !== "undefined") {
+        fields.categoryId = CFG.CATEGORY_ID;
+      }
+
+      // ключевой UF номер удостоверения (как у вас в clean-скрипте)
+      fields[CFG.UF_CERT_NO] = certNo;
+
+      // UF из строки по 2-й строке
+      for (const colStr of Object.keys(ufByCol)) {
+        const c = Number(colStr);
+        const uf = ufByCol[c];
+
+        // пропустим UF_CERT_NO — он уже заполнен и является ключом
+        if (uf === CFG.UF_CERT_NO) continue;
+
+        const colName = String(header[c] || "").trim().toLowerCase();
+        const v = row[c];
+
+        // даты -> YYYY-MM-DD
+        if (colName.includes("дата")) {
+          const d = toBitrixDate_(v);
+          if (d) fields[uf] = d;
+          continue;
+        }
+
+        // обычные значения
+        const s = String(v ?? "").trim();
+        if (!s) continue;
+        fields[uf] = s;
+      }
+
+      // Найдём существующий элемент по сделке + номеру удостоверения
+      const existingId = findExistingId_(dealId, certNo);
+
+      let action = "";
+      let respTxt = "";
+      let debugTxt = "";
+
+      // Фото: по ФИО из первой колонки (A) (при желании можете сменить колонку)
+      let photoPayload = null;
+      if (photoIndex && CFG.UF_PHOTO) {
+        const fio = String(row[0] || "").trim();
+        if (fio) {
+          const pick = pickUniquePhotoByFio_(photoIndex, fio);
+          if (pick.ok) {
+            const file = getFileFromFolderByName_(CFG.PHOTO_FOLDER_ID, pick.fileName);
+            if (file) {
+              const blob = file.getBlob();
+              const b64 = Utilities.base64Encode(blob.getBytes());
+              // одиночное file поле (как в вашем oauth-скрипте) :contentReference[oaicite:4]{index=4}
+              photoPayload = [file.getName(), b64];
+              debugTxt = "PHOTO_READY=" + file.getName();
+            } else {
+              debugTxt = "PHOTO_MISSING_IN_FOLDER=" + pick.fileName;
+            }
+          } else {
+            debugTxt = "PHOTO_" + pick.reason + " key=" + pick.key;
+          }
+        }
+      }
+
+      let itemId = existingId || "";
+
+      if (existingId) {
+        action = "♻️ UPDATED";
+        const upd = callB24_("crm.item.update", {
+          entityTypeId: CFG.ENTITY_TYPE_ID,
+          id: Number(existingId),
+          fields
+        });
+
+        respTxt = upd.txt;
+
+        // Фото обновляем отдельным update (надёжнее)
+        if (photoPayload && (CFG.ALWAYS_UPDATE_PHOTO || true)) {
+          try {
+            const photoRes = callB24_("crm.item.update", {
+              entityTypeId: CFG.ENTITY_TYPE_ID,
+              id: Number(existingId),
+              fields: { [CFG.UF_PHOTO]: photoPayload }
+            });
+            respTxt += "\n" + photoRes.txt;
+            debugTxt = (debugTxt ? debugTxt + "; " : "") + "PHOTO_UPDATED";
+          } catch (e) {
+            debugTxt = (debugTxt ? debugTxt + "; " : "") + "PHOTO_ERROR";
+            respTxt += "\nPHOTO_ERROR=" + String(e);
+          }
+        }
+
+      } else {
+        action = "✅ CREATED";
+
+        // Создаём без parent, потом линкуем сделку (как в clean-скрипте) :contentReference[oaicite:5]{index=5}
+        const add = callB24_("crm.item.add", {
+          entityTypeId: CFG.ENTITY_TYPE_ID,
+          fields
+        });
+
+        itemId =
+          (add.json && add.json.result && add.json.result.item && add.json.result.item.id) ||
+          (add.json && add.json.result && add.json.result.id) || "";
+
+        if (!itemId) {
+          writeCell_(sh, r, colStatus, "❌ ADD FAIL");
+          writeCell_(sh, r, colResp, truncate_(add.txt, 1800));
+          writeCell_(sh, r, colSyncAt, new Date());
+          writeCell_(sh, r, colDebug, truncate_(debugTxt, 500));
+          continue;
+        }
+
+        const link = callB24_("crm.item.update", {
+          entityTypeId: CFG.ENTITY_TYPE_ID,
+          id: Number(itemId),
+          fields: { PARENT_ID_2: Number(dealId) }
+        });
+
+        respTxt = add.txt + "\n" + link.txt;
+
+        // Фото после создания
+        if (photoPayload) {
+          try {
+            const photoRes = callB24_("crm.item.update", {
+              entityTypeId: CFG.ENTITY_TYPE_ID,
+              id: Number(itemId),
+              fields: { [CFG.UF_PHOTO]: photoPayload }
+            });
+            respTxt += "\n" + photoRes.txt;
+            debugTxt = (debugTxt ? debugTxt + "; " : "") + "PHOTO_UPDATED";
+          } catch (e) {
+            debugTxt = (debugTxt ? debugTxt + "; " : "") + "PHOTO_ERROR";
+            respTxt += "\nPHOTO_ERROR=" + String(e);
+          }
+        }
+      }
+
+      // Запись логов
+      writeCell_(sh, r, colItemId, itemId);
+      writeCell_(sh, r, colStatus, action + (itemId ? (" id=" + itemId) : ""));
+      writeCell_(sh, r, colSyncAt, new Date());
+      writeCell_(sh, r, colResp, truncate_(respTxt, 1800));
+      writeCell_(sh, r, colDebug, truncate_(debugTxt, 500));
+
+      Utilities.sleep(CFG.SLEEP_MS);
+
+    } catch (err) {
+      writeCell_(sh, r, colStatus, "❌ ERROR");
+      writeCell_(sh, r, colSyncAt, new Date());
+      writeCell_(sh, r, colResp, truncate_(String(err), 1800));
+    }
+  }
+}
+
+/** ====== FIND EXISTING (upsert ключ) ====== */
+function findExistingId_(dealId, certNo) {
+  const res = callB24_("crm.item.list", {
+    entityTypeId: CFG.ENTITY_TYPE_ID,
+    filter: {
+      parentId2: Number(dealId),
+      [CFG.UF_CERT_NO]: String(certNo)
+    },
+    select: ["id"],
+    order: { id: "desc" }
+  });
+
+  return (res.json && res.json.result && res.json.result.items && res.json.result.items[0] && res.json.result.items[0].id) || null;
+}
+
+/** ====== PHOTO HELPERS ====== */
+function buildPhotoIndex_(folderId) {
+  const folder = DriveApp.getFolderById(String(folderId).trim());
+  const it = folder.getFiles();
+  const map = new Map(); // key -> [fileName...]
+
+  while (it.hasNext()) {
+    const f = it.next();
+    const key = normalizeKey_(stripExt_(f.getName()));
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(f.getName());
+  }
+  return map;
+}
+
+function pickUniquePhotoByFio_(photoIndex, fio) {
+  const key = normalizeKey_(fio);
+  const arr = photoIndex.get(key) || [];
+  if (arr.length === 0) return { ok: false, reason: "NOT_FOUND", key, files: [] };
+  if (arr.length > 1) return { ok: false, reason: "AMBIGUOUS", key, files: arr };
+  return { ok: true, key, fileName: arr[0] };
+}
+
+function getFileFromFolderByName_(folderId, fileName) {
+  const folder = DriveApp.getFolderById(String(folderId).trim());
+  const it = folder.getFilesByName(fileName);
+  if (!it.hasNext()) return null;
+  return it.next();
+}
+
+/** ====== SHEET HELPERS ====== */
+function findCol_(headerArr, name) {
+  const n = String(name || "").trim().toLowerCase();
+  return headerArr.findIndex(h => String(h || "").trim().toLowerCase() === n);
+}
+
+function ensureCol_(sh, headerArr, name) {
+  let idx = headerArr.indexOf(name);
+  if (idx === -1) {
+    idx = headerArr.length;
+    headerArr.push(name);
+    sh.getRange(1, idx + 1).setValue(name);
+  }
+  return idx;
+}
+
+function writeCell_(sh, rZeroBased, cZeroBased, value) {
+  sh.getRange(rZeroBased + 1, cZeroBased + 1).setValue(value);
+}
+
+// "{UfCrm101768477470}" -> "ufCrm10_1768477470"
+function ufFromToken_(token) {
+  const m = String(token || "").trim().match(/^\{UfCrm(\d+)\}$/i);
+  if (!m) return null;
+  const digits = m[1];
+  if (!digits.startsWith("10")) return null;
+  return "ufCrm10_" + digits.substring(2);
+}
+
+function buildUfMapFromSecondRow_(codesRow) {
+  const map = {};
+  for (let c = 0; c < codesRow.length; c++) {
+    const uf = ufFromToken_(codesRow[c]);
+    if (uf) map[c] = uf;
+  }
+  return map;
+}
+
+/** Bitrix type=date => "YYYY-MM-DD" */
+function toBitrixDate_(v) {
+  if (v === null || v === undefined || v === "") return "";
+
+  if (v instanceof Date) {
+    return Utilities.formatDate(v, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  }
+
+  // Sheets serial date
+  if (typeof v === "number") {
+    const d = new Date(Math.round((v - 25569) * 86400 * 1000));
+    return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  }
+
+  const s = String(v).trim();
+  const dm = s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if (dm) return `${dm[3]}-${dm[2]}-${dm[1]}`;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  return "";
+}
+
+/** ====== STRING HELPERS ====== */
+function stripExt_(name) { return String(name || "").replace(/\.[^.]+$/, ""); }
+
+function normalizeKey_(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function truncate_(s, n) {
+  s = String(s ?? "");
+  return s.length > n ? s.substring(0, n) : s;
+}
+
+function safeJson_(txt) {
+  try { return JSON.parse(txt); } catch (_) { return null; }
+}
+
+/** ====== CFG/PROPS HELPERS ====== */
+function getClientId_() {
+  const id = (PROP.getProperty(KEYS.CLIENT_ID) || "").trim();
+  if (!id) throw new Error("Нет B24_CLIENT_ID. Запустите setupCredentialsOnce().");
+  return id;
+}
+
+function getClientSecret_() {
+  const sec = (PROP.getProperty(KEYS.CLIENT_SECRET) || "").trim();
+  if (!sec) throw new Error("Нет B24_CLIENT_SECRET. Запустите setupCredentialsOnce().");
+  return sec;
+}
+
+function getWebAppUrl_() {
+  const url1 = ScriptApp.getService().getUrl() || "";
+  if (url1) return url1;
+
+  const url2 = (PROP.getProperty(KEYS.WEBAPP_URL) || "").trim();
+  if (url2) return url2;
+
+  const url3 = (CFG.WEBAPP_URL || "").trim();
+  if (url3) return url3;
+
+  throw new Error("Не найден URL веб-приложения. Deploy WebApp и/или saveWebAppUrlOnce() или CFG.WEBAPP_URL.");
+}
